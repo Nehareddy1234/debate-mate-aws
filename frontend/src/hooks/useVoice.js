@@ -15,7 +15,7 @@
 
 import { useRef, useState, useCallback, useEffect } from 'react'
 
-const WS_URL = 'ws://localhost:8000/ws/debate'
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/debate`
 const MIC_SAMPLE_RATE = 16_000
 const PLAY_SAMPLE_RATE = 24_000
 const CHUNK_INTERVAL_MS = 250
@@ -31,6 +31,13 @@ export function useVoice({ onMessage }) {
     const processorRef = useRef(null)
     const chunkBufRef = useRef([])
     const intervalRef = useRef(null)
+
+    // Connection resilience: auto-reconnect with exponential backoff unless
+    // the close was intentional (logout/end) or an auth rejection (4001).
+    const intentionalCloseRef = useRef(false)
+    const lastConfigRef = useRef(null)
+    const pendingMessagesRef = useRef([])
+    const backoffRef = useRef(1000)
 
     // Gapless TTS playback: chunks are scheduled back-to-back on the
     // AudioContext clock. Waiting for onended between chunks (old approach)
@@ -52,6 +59,9 @@ export function useVoice({ onMessage }) {
             return
         }
 
+        intentionalCloseRef.current = false
+        lastConfigRef.current = { topic, user_side, user_role, first_speaker }
+
         console.log(`[WS] Connecting to ${WS_URL}...`)
         const ws = new WebSocket(WS_URL)
         ws.binaryType = 'arraybuffer'
@@ -61,15 +71,23 @@ export function useVoice({ onMessage }) {
             console.log('[WS] Connected successfully.')
             setConnected(true)
             // SETUP HANDSHAKE — first JSON metadata frame the backend expects:
-            // { topic, user_side ("Pro"/"Con"), first_speaker ("AI"/"User") }
+            // { topic, user_side ("Pro"/"Con"), first_speaker ("AI"/"User"),
+            //   token (JWT) }. The token rides in-frame, not in the URL.
             const payload = {
                 type: 'start_debate',
                 topic,
                 user_side: user_side || user_role || 'Pro',
                 first_speaker: String(first_speaker).toLowerCase() === 'ai' ? 'AI' : 'User',
+                token: localStorage.getItem('dm_token') || undefined,
             }
-            console.log('[WS] Sending handshake:', payload)
+            console.log('[WS] Sending handshake')
             ws.send(JSON.stringify(payload))
+
+            // Deliver anything queued while the socket was down
+            while (pendingMessagesRef.current.length) {
+                ws.send(JSON.stringify(pendingMessagesRef.current.shift()))
+            }
+            backoffRef.current = 1000
         }
 
         ws.onmessage = (event) => {
@@ -115,12 +133,23 @@ export function useVoice({ onMessage }) {
             setConnected(false)
             setMicActive(false)
             setIsAiSpeaking(false)
+
+            if (intentionalCloseRef.current || e.code === 4001) return
+            const delay = backoffRef.current
+            backoffRef.current = Math.min(delay * 2, 30000)
+            console.log(`[WS] Reconnecting in ${delay}ms...`)
+            setTimeout(() => {
+                if (!intentionalCloseRef.current) {
+                    connect(lastConfigRef.current || {})
+                }
+            }, delay)
         }
         ws.onerror = (e) => console.error('[WS] Connection error:', e)
     }, [onMessage])
 
     const disconnect = useCallback(() => {
         console.log('[WS] Disconnecting manually...')
+        intentionalCloseRef.current = true
         wsRef.current?.close()
         _stopMicInternal()
     }, [])
@@ -129,7 +158,9 @@ export function useVoice({ onMessage }) {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify(json))
         } else {
-            console.warn('[WS] sendMessage called but WS not open')
+            // Queue instead of dropping so help requests survive reconnects
+            pendingMessagesRef.current.push(json)
+            console.warn('[WS] sendMessage queued — WS not open')
         }
     }, [])
 
@@ -230,6 +261,13 @@ export function useVoice({ onMessage }) {
 
         } catch (e) {
             console.error('[Mic] Error accessing microphone:', e)
+            const guidance =
+                e.name === 'NotAllowedError'
+                    ? 'Microphone access denied. Allow mic access for this site and try again.'
+                    : e.name === 'NotFoundError'
+                        ? 'No microphone found. Connect one and try again.'
+                        : `Microphone error: ${e.message || e.name}`
+            onMessage?.({ type: 'error', text: guidance })
         }
     }, [micActive])
 
@@ -250,6 +288,17 @@ export function useVoice({ onMessage }) {
     }
 
     // ── Audio playback (24000Hz — Deepgram Aura-2 linear16 PCM) ──
+
+    /** Create/resume the playback context inside a user gesture (Start
+     *  click) so browsers' autoplay policy can't silence AI-first speech. */
+    const primeAudio = useCallback(async () => {
+        if (!playCtxRef.current) {
+            playCtxRef.current = new AudioContext({ sampleRate: PLAY_SAMPLE_RATE })
+        }
+        if (playCtxRef.current.state === 'suspended') {
+            await playCtxRef.current.resume()
+        }
+    }, [])
 
     async function _queueAudio(arrayBuffer) {
         // Decode one PCM chunk and schedule it immediately after the
@@ -336,6 +385,7 @@ export function useVoice({ onMessage }) {
         startMic,
         stopMic,
         sendMessage,
+        primeAudio,
         connected,
         micActive,
         isUserSpeaking,

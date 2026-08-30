@@ -1,0 +1,32 @@
+# Render Blueprint — one-click deploy
+# The built frontend (frontend/dist) is committed and served by FastAPI,
+# so only the Python backend needs building here.
+# Users + transcripts persist in AWS S3: create a bucket first, then set
+# S3_BUCKET and AWS credentials below (see README "Deployment").
+services:
+  - type: web
+    name: debatemate
+    runtime: python
+    plan: free            # free tier sleeps after inactivity; use a paid plan for always-on
+    buildCommand: pip install -r requirements.txt
+    startCommand: python voice_server.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: GOOGLE_API_KEY
+        sync: false       # set in the Render dashboard
+      - key: DEEPGRAM_API_KEY
+        sync: false       # set in the Render dashboard
+      - key: OPENAI_API_KEY
+        sync: false       # optional fallback provider
+      - key: JWT_SECRET
+        generateValue: true
+      - key: S3_BUCKET
+        sync: false       # your bucket name, e.g. debatemate-data
+      - key: AWS_REGION
+        sync: false       # e.g. us-east-1
+      - key: AWS_ACCESS_KEY_ID
+        sync: false       # IAM user with S3 access to that bucket only
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false

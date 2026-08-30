@@ -1,5 +1,5 @@
 """
-voice_server.py — FastAPI WebSocket Orchestration (V10)
+voice_server.py — FastAPI WebSocket Orchestration (V11 — production hardening)
 
 Pipeline overview (one /ws/debate connection == one DebateSession):
 
@@ -20,77 +20,110 @@ Pipeline overview (one /ws/debate connection == one DebateSession):
                        - event=StartOfTurn -> reset per-turn accumulators
                        - event=EndOfTurn   -> carries the complete turn
                          transcript; ONLY here the LangGraph LLM is
-                         triggered (no premature cutoffs). Turns with
-                         end_of_turn confidence < 0.65 or fewer than
-                         2 words are discarded.
+                         triggered (no premature cutoffs). Turns failing
+                         the noise guard (< 0.65 confidence or < 2 words)
+                         are discarded.
 
   4. ASYNC MODEL       Deepgram frames arrive through the asyncio-native
                        `websockets` client, so every event is ALREADY handled
                        on the FastAPI event loop — no thread hop required.
-                       (If you migrate to the official Deepgram SDK, whose
-                       callbacks fire on a worker thread, every dispatch into
-                       this loop MUST use asyncio.run_coroutine_threadsafe(),
-                       or events are silently dropped.)
 
   5. LLM + TTS         final turn text -> LangGraph brain (Gemini via
                        langchain-google-genai when GOOGLE_API_KEY is set,
-                       else OpenAI) -> structured reply -> Aura TTS ->
-                       binary linear16 audio frames back to the client
-                       between typed audio_start / audio_end JSON frames.
+                       else OpenAI-compatible) -> structured reply ->
+                       Aura TTS -> binary linear16 audio frames back to the
+                       client between typed audio_start / audio_end JSON
+                       frames. LLM calls are bounded by LLM_TIMEOUT_S.
 
   6. CLEANUP           WebSocketDisconnect / RuntimeError are caught, all
                        background tasks cancelled, CloseStream sent to
                        Deepgram STT.
 
-  7. POST /save_transcript appends metadata (topic, timestamps, total turns)
-                       and writes structured JSON into ./transcripts/.
+  7. POST /transcripts persists the debate per authenticated user in the
+       database (SQLite locally, Postgres in production). Input is fully
+       validated by Pydantic (schemas.SaveTranscriptRequest).
+       POST /save_transcript remains as a deprecated, auth-required alias.
+
+Hardening notes: all diagnostics go through the logging module; client-facing
+error messages are generic (details stay server-side); CORS origins come from
+CORS_ORIGINS; /healthz serves the Render health check.
 """
 
 import asyncio
 import json
+import logging
 import os
-import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 import websockets
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+
+from auth import JWT_SECRET, decode_token, get_current_user
+from logging_config import setup_logging
+from rate_limit import limiter
+from routes_auth import router as auth_router
+from routes_transcripts import persist_transcript
+from routes_transcripts import router as transcripts_router
+from schemas import SaveTranscriptRequest
+from storage import store
 
 # LangGraph components from main.py
 from main import DebateState, app_brain, app_opening, app_help
 
 load_dotenv()
+setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────── Setup ────────────────────────────
 
 app = FastAPI(title="AI Debate Coach API")
 
+# Env-driven origins; never combine "*" with credentials (spec violation).
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+# Rate limiting (per-IP; decorators on the routers set the actual limits)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request, exc):
+    return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+
+
+app.add_middleware(SlowAPIMiddleware)
+
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+app.include_router(transcripts_router, prefix="/transcripts",
+                   tags=["transcripts"])
 
 DEEPGRAM_API_KEY = (os.getenv("DEEPGRAM_API_KEY") or "").strip()
 if not DEEPGRAM_API_KEY:
     raise RuntimeError("DEEPGRAM_API_KEY not found in .env — please add it before starting.")
 
 # LLM provider check (mirrors main.py selection: GOOGLE_API_KEY -> Gemini,
-# else OpenAI). Fail fast instead of erroring on the first spoken turn.
+# else OpenAI-compatible). Fail fast instead of erroring on the first turn.
 if os.getenv("GOOGLE_API_KEY"):
-    print("[Startup] LLM provider: Gemini (GOOGLE_API_KEY set)")
+    logger.info("Startup: LLM provider Gemini (GOOGLE_API_KEY set)")
 elif (os.getenv("OPENAI_API_KEY") or "").strip():
     _base = (os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or "").strip()
-    print(f"[Startup] LLM provider: OpenAI-compatible "
-          f"({'endpoint: ' + _base if _base else 'api.openai.com'}, "
-          f"model: {os.getenv('OPENAI_MODEL', 'gpt-4o')})")
+    logger.info("Startup: LLM provider OpenAI-compatible (endpoint=%s, model=%s)",
+                _base or "api.openai.com", os.getenv("OPENAI_MODEL", "gpt-4o"))
 else:
     raise RuntimeError(
         "Neither OPENAI_API_KEY nor GOOGLE_API_KEY is set in .env — "
@@ -125,43 +158,52 @@ TTS_SAMPLE_RATE = 24_000
 MIN_TURN_WORDS = 2
 MIN_CONFIDENCE = 0.65
 
+# Bounds on external calls so a hung provider can't wedge a session.
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "30"))
+TTS_OPEN_TIMEOUT_S = 10
+TTS_PING_TIMEOUT_S = 15
+
 # Cooldown between STT connect attempts (avoids a retry storm on failure)
 STT_RECONNECT_COOLDOWN_S = 5.0
 
-TRANSCRIPTS_DIR = Path("transcripts")
-TRANSCRIPTS_DIR.mkdir(exist_ok=True)
+
+def _should_accept_turn(text: str, confidence: float | None) -> tuple[bool, str]:
+    """Pure noise guard: returns (accept, reason). Extracted for testability."""
+    if not text:
+        return False, "empty"
+    if len(text.split()) < MIN_TURN_WORDS:
+        return False, "too-short"
+    if confidence is not None and confidence < MIN_CONFIDENCE:
+        return False, "low-confidence"
+    return True, "ok"
 
 
-# ─────────────────────────── REST endpoint ────────────────────
+# ─────────────────────────── REST endpoints ────────────────────
 
-@app.post("/save_transcript")
-async def save_transcript(payload: dict):
-    """Append metadata (topic, timestamps, total turns) and persist the
-    full transcript as structured JSON under ./transcripts/."""
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
+@app.post("/save_transcript", deprecated=True)
+async def save_transcript(payload: SaveTranscriptRequest,
+                          user: dict = Depends(get_current_user)):
+    """Deprecated alias of POST /transcripts kept for old clients."""
     try:
-        session_id = payload.get("session_id") or str(uuid.uuid4())
-        transcript = payload.get("transcript", [])
-        topic      = payload.get("topic", "Unknown Topic")
+        row = await persist_transcript(user, payload)
+        return JSONResponse({"status": "saved", "id": row["id"]})
+    except Exception:
+        logger.error("Save transcript failed", exc_info=True)
+        return JSONResponse({"status": "error", "message": "Internal server error"},
+                            status_code=500)
 
-        data = {
-            "session_id":  session_id,
-            "topic":       topic,
-            "user_side":   payload.get("user_side", payload.get("user_role")),
-            "started_at":  payload.get("started_at"),
-            "saved_at":    datetime.now().isoformat(),
-            "total_turns": len(transcript),
-            "transcript":  transcript,
-        }
 
-        filename = TRANSCRIPTS_DIR / (
-            f"debate_{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        )
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-        return JSONResponse({"status": "saved", "file": str(filename)})
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+@app.on_event("startup")
+async def _startup():
+    logger.info("Storage backend: %s", store.label)
+    if JWT_SECRET == "dev-only-insecure-secret-change-in-prod":
+        logger.warning("JWT_SECRET is the dev default — set it in .env/Render "
+                       "before exposing this service.")
 
 
 # ─────────────────────────── Session ──────────────────────────
@@ -172,6 +214,7 @@ class DebateSession:
     def __init__(self, websocket: WebSocket):
         self.ws = websocket
         self.session_id = str(uuid.uuid4())
+        self.user_id: str | None = None   # set by the authenticated handshake
 
         # ── Connection session state (filled by the setup handshake) ──
         self.topic = "General Debate"
@@ -208,6 +251,7 @@ class DebateSession:
 
         # Serializes AI turns so opening / rebuttal / hint never interleave
         self._respond_lock = asyncio.Lock()
+        self._opening_task: asyncio.Task | None = None
         self._closed = False
 
     # ── Outbound helpers ──────────────────────────────────────────
@@ -219,7 +263,7 @@ class DebateSession:
         try:
             await self.ws.send_json(payload)
         except Exception as exc:
-            print(f"[WS] JSON send failed ({exc!r}) — closing session.")
+            logger.warning("WS JSON send failed (%r) — closing session.", exc)
             self._closed = True
 
     async def _send_bytes(self, chunk: bytes):
@@ -228,7 +272,7 @@ class DebateSession:
         try:
             await self.ws.send_bytes(chunk)
         except Exception as exc:
-            print(f"[WS] Binary send failed ({exc!r}) — closing session.")
+            logger.warning("WS binary send failed (%r) — closing session.", exc)
             self._closed = True
 
     # ── Main loop ─────────────────────────────────────────────────
@@ -258,13 +302,13 @@ class DebateSession:
                     await self._handle_audio_frame(raw_bytes)
 
         except WebSocketDisconnect:
-            print("[WS] Client disconnected")
+            logger.info("WS client disconnected")
         except RuntimeError as exc:
             # Starlette raises this when receive() is called after the
             # disconnect message was already consumed — treat as disconnect.
-            print(f"[WS] Receive after disconnect: {exc}")
+            logger.info("WS receive after disconnect: %s", exc)
         except Exception:
-            print(f"[WS] Unexpected error:\n{traceback.format_exc()}")
+            logger.error("WS unexpected error", exc_info=True)
         finally:
             await self.cleanup(worker_tasks)
 
@@ -274,7 +318,7 @@ class DebateSession:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            print(f"[WS] Ignoring non-JSON text frame: {raw[:80]!r}")
+            logger.warning("WS ignoring non-JSON text frame: %r", raw[:80])
             return
 
         msg_type = data.get("type")
@@ -282,10 +326,10 @@ class DebateSession:
         if msg_type in ("setup", "start_debate"):
             await self._handle_setup(data)
         elif msg_type == "help_request":
-            print("[WS] Help requested via button")
+            logger.info("WS help requested via button")
             await self.help_queue.put(True)
         else:
-            print(f"[WS] Ignoring unknown control frame: {msg_type!r}")
+            logger.warning("WS ignoring unknown control frame: %r", msg_type)
 
     async def _handle_setup(self, data: dict):
         """
@@ -293,6 +337,23 @@ class DebateSession:
         session: topic, user_side ("Pro"/"Con"), first_speaker ("AI"/"User").
         If the AI speaks first, the opening turn is triggered immediately.
         """
+        # AUTH: the setup frame must carry a valid JWT (sent in-frame, not in
+        # the URL, so tokens never appear in access logs).
+        token = (data.get("token") or "").strip()
+        if not token:
+            logger.warning("WS setup rejected: missing auth token")
+            self._closed = True
+            await self.ws.close(code=4001, reason="Missing auth token")
+            return
+        try:
+            claims = decode_token(token)
+        except HTTPException:
+            logger.warning("WS setup rejected: invalid auth token")
+            self._closed = True
+            await self.ws.close(code=4001, reason="Invalid auth token")
+            return
+        self.user_id = claims["sub"]
+
         # topic
         topic = (data.get("topic") or "").strip()
         if topic:
@@ -312,10 +373,8 @@ class DebateSession:
         self.state["topic"] = self.topic
         self.state["user_side"] = self.user_side
 
-        print(
-            f"[WS] Handshake: topic='{self.topic}', "
-            f"user_side={self.user_side}, first_speaker={self.first_speaker}"
-        )
+        logger.info("WS handshake: topic=%r user_side=%s first_speaker=%s",
+                    self.topic, self.user_side, self.first_speaker)
 
         await self._send_json({
             "type": "setup_ack",
@@ -325,11 +384,12 @@ class DebateSession:
             "first_speaker": self.first_speaker,
         })
 
-        # AI OPENING TURN: fire-and-forget task so the receive loop keeps
-        # running (the respond lock guarantees ordering with later turns).
+        # AI OPENING TURN: tracked task so cleanup can cancel it; the respond
+        # lock guarantees ordering with later turns.
         if self.first_speaker == "AI":
-            print("[WS] AI speaks first — generating opening argument...")
-            asyncio.create_task(self._agent_turn(is_opening=True))
+            logger.info("WS AI speaks first — generating opening argument...")
+            self._opening_task = asyncio.create_task(
+                self._agent_turn(is_opening=True), name="opening-turn")
 
     async def _handle_audio_frame(self, chunk: bytes):
         """Mic PCM (16-bit, 16 kHz, mono) from the browser."""
@@ -339,7 +399,7 @@ class DebateSession:
         # Diagnostic: proves client audio bytes are reaching the server
         if not self._first_audio_logged:
             self._first_audio_logged = True
-            print(f"[WS] First audio chunk received from client ({len(chunk)} bytes)")
+            logger.info("WS first audio chunk received from client (%d bytes)", len(chunk))
 
         if not self.stt_connected.is_set():
             # Cooldown after a failed connect — otherwise every chunk would
@@ -348,7 +408,7 @@ class DebateSession:
             if self._stt_failed_ts and now - self._stt_failed_ts < STT_RECONNECT_COOLDOWN_S:
                 if not self._cooldown_logged:
                     self._cooldown_logged = True
-                    print("[STT] Reconnect cooldown active — dropping mic audio until retry.")
+                    logger.info("STT reconnect cooldown active — dropping mic audio until retry.")
                 return
             self._cooldown_logged = False
             # Lazy connect on the FIRST chunk — avoids Deepgram NET-0001
@@ -368,7 +428,7 @@ class DebateSession:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                print(f"[Turn Worker] Error:\n{traceback.format_exc()}")
+                logger.error("Turn worker error", exc_info=True)
             finally:
                 self.turn_queue.task_done()
 
@@ -381,7 +441,7 @@ class DebateSession:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                print(f"[Help Worker] Error:\n{traceback.format_exc()}")
+                logger.error("Help worker error", exc_info=True)
             finally:
                 self.help_queue.task_done()
 
@@ -409,13 +469,24 @@ class DebateSession:
 
                 await self._send_json({"type": "ai_thinking_start"})
 
-                # 3. Run LangGraph
-                final_state = await graph.ainvoke({
-                    "messages":       self.state["messages"],
-                    "topic":          self.state["topic"],
-                    "user_side":      self.state["user_side"],
-                    "debate_summary": self.state["debate_summary"],
-                })
+                # 3. Run LangGraph (bounded so a hung provider can't wedge us)
+                try:
+                    final_state = await asyncio.wait_for(
+                        graph.ainvoke({
+                            "messages":       self.state["messages"],
+                            "topic":          self.state["topic"],
+                            "user_side":      self.state["user_side"],
+                            "debate_summary": self.state["debate_summary"],
+                        }),
+                        timeout=LLM_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("LLM call timed out after %.0fs", LLM_TIMEOUT_S)
+                    await self._send_json({
+                        "type": "error",
+                        "text": "The AI took too long to respond. Please try again.",
+                    })
+                    return
 
                 # 4. Persist resulting state back into the session
                 self.state["messages"]       = final_state["messages"]
@@ -442,10 +513,10 @@ class DebateSession:
                 # 6. Stream the spoken reply as binary PCM audio
                 await self._stream_tts(rebuttal)
 
-            except Exception as exc:
-                print(f"[Brain Error] {traceback.format_exc()}")
+            except Exception:
+                logger.error("Agent turn failed", exc_info=True)
                 await self._send_json({"type": "error",
-                                       "text": f"Agent error: {exc}"})
+                                       "text": "An internal error occurred. Please try again."})
             finally:
                 await self._send_json({"type": "ai_thinking_end"})
 
@@ -472,7 +543,11 @@ class DebateSession:
                 "sample_rate": TTS_SAMPLE_RATE,
             })
 
-            async with websockets.connect(tts_url, extra_headers=headers) as tts_ws:
+            async with websockets.connect(
+                tts_url, extra_headers=headers,
+                open_timeout=TTS_OPEN_TIMEOUT_S,
+                ping_timeout=TTS_PING_TIMEOUT_S,
+            ) as tts_ws:
                 # Control protocol per Deepgram docs: Speak (text) then Flush.
                 # "Flushed" only arrives in response to Flush; without it the
                 # buffer is never synthesized and this loop would hang.
@@ -490,12 +565,12 @@ class DebateSession:
                         if evt_type == "Flushed":
                             break   # synthesis complete
                         if evt_type == "Warning":
-                            print(f"[Deepgram TTS Warning] {evt}")
+                            logger.warning("Deepgram TTS warning: %s", evt)
 
         except asyncio.CancelledError:
             raise
         except Exception:
-            print(f"[Deepgram TTS Error]\n{traceback.format_exc()}")
+            logger.error("Deepgram TTS error", exc_info=True)
         finally:
             # Always close the audio window, even on failure
             await self._send_json({"type": "audio_end"})
@@ -507,24 +582,24 @@ class DebateSession:
         url = f"{DG_STT_URL}?{DG_STT_PARAMS}"
         headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
-        print("[Deepgram STT] Connecting on first mic audio...")
+        logger.info("Deepgram STT connecting on first mic audio...")
         try:
             self.stt_ws = await websockets.connect(url, extra_headers=headers)
         except websockets.exceptions.InvalidStatusCode as e:
             self._stt_failed_ts = asyncio.get_event_loop().time()
-            print(f"[Deepgram STT Error] Rejected — HTTP {e.status_code}")
+            logger.error("Deepgram STT rejected — HTTP %s", e.status_code)
             await self._send_json(
-                {"type": "error", "text": f"STT auth failed (HTTP {e.status_code})."})
+                {"type": "error", "text": "Speech recognition unavailable. Check your connection."})
             return
         except Exception as e:
             self._stt_failed_ts = asyncio.get_event_loop().time()
-            print(f"[Deepgram STT Error] Connection failed: {e}")
+            logger.error("Deepgram STT connection failed: %s", e)
             await self._send_json(
-                {"type": "error", "text": f"STT connection failed: {e}"})
+                {"type": "error", "text": "Speech recognition unavailable. Check your connection."})
             return
 
         self.stt_connected.set()
-        print("[Deepgram STT] Connected.")
+        logger.info("Deepgram STT connected.")
 
         await self.stt_ws.send(first_chunk)
         self.last_audio_ts = asyncio.get_event_loop().time()
@@ -552,9 +627,9 @@ class DebateSession:
         except asyncio.CancelledError:
             pass
         except websockets.exceptions.ConnectionClosed:
-            print("[Deepgram STT] Sender: connection closed.")
+            logger.info("Deepgram STT sender: connection closed.")
         except Exception as e:
-            print(f"[Deepgram STT Error] Sender: {e}")
+            logger.error("Deepgram STT sender error: %s", e)
 
     async def _stt_receiver(self, stt_ws):
         """
@@ -580,15 +655,15 @@ class DebateSession:
                     await self._handle_turn_info(data)
 
                 elif msg_type == "FatalError":
-                    print(f"[Deepgram STT] FatalError from Deepgram: {data}")
+                    logger.error("Deepgram STT FatalError: %s", data)
                     self._reset_stt_for_reconnect()
                     break
 
                 elif msg_type == "Error":
-                    print(f"[Deepgram STT] Error event from Deepgram: {data}")
+                    logger.error("Deepgram STT error event: %s", data)
 
                 elif msg_type == "Connected":
-                    print("[Deepgram STT] Upstream Connected event received.")
+                    logger.info("Deepgram STT upstream Connected event received.")
 
                 elif msg_type == "Update":
                     # Real-time live captioning — never triggers the LLM
@@ -641,21 +716,20 @@ class DebateSession:
                         await self._finalize_turn()
 
                 elif msg_type == "Metadata":
-                    print(f"[Deepgram STT] Metadata — duration: "
-                          f"{data.get('duration')}")
+                    logger.info("Deepgram STT metadata — duration: %s", data.get("duration"))
 
                 else:
                     # Unknown event type — log once-ish for diagnostics so a
                     # silent pipeline is never silent for long.
-                    print(f"[Deepgram STT] Unhandled event type: {msg_type!r}")
+                    logger.warning("Deepgram STT unhandled event type: %r", msg_type)
 
         except asyncio.CancelledError:
             pass
         except websockets.exceptions.ConnectionClosed as e:
-            print(f"[Deepgram STT] Receiver: connection closed ({e.code}).")
+            logger.info("Deepgram STT receiver: connection closed (%s).", e.code)
             self._reset_stt_for_reconnect()
         except Exception as e:
-            print(f"[Deepgram STT Error] Receiver: {e}")
+            logger.error("Deepgram STT receiver error: %s", e)
             self._reset_stt_for_reconnect()
 
     async def _handle_turn_info(self, data: dict):
@@ -696,10 +770,10 @@ class DebateSession:
 
         elif event in ("EagerEndOfTurn", "TurnResumed"):
             # Only emitted when eager_eot_threshold is set — we don't use it.
-            print(f"[Deepgram STT] TurnInfo event ignored: {event}")
+            logger.info("Deepgram STT TurnInfo event ignored: %s", event)
 
         else:
-            print(f"[Deepgram STT] Unknown TurnInfo event: {event!r}")
+            logger.warning("Deepgram STT unknown TurnInfo event: %r", event)
 
     def _reset_stt_for_reconnect(self):
         """The upstream STT socket died — cancel the stale worker tasks and
@@ -710,7 +784,7 @@ class DebateSession:
         self.stt_tasks = []
         self.stt_connected.clear()
         self.stt_ws = None
-        print("[Deepgram STT] Connection reset — will reconnect on next audio.")
+        logger.info("Deepgram STT connection reset — will reconnect on next audio.")
 
     def _buffer_final_segment(self, text: str, confidence: float | None):
         """Accumulate a finalized segment (with confidence) for the current
@@ -732,7 +806,6 @@ class DebateSession:
         2 words (ambient clicks / fillers) never reach the LLM.
         """
         text = " ".join(self._turn_buffer).strip()
-        word_count = len(text.split())
         confidence = (
             sum(self._turn_conf) / len(self._turn_conf) if self._turn_conf else None
         )
@@ -742,19 +815,14 @@ class DebateSession:
         self._turn_conf.clear()
         self._last_final_segment = ""
 
-        if not text:
-            print("[STT] Discarded empty turn.")
-            return
-        if word_count < MIN_TURN_WORDS:
-            print(f"[STT] Discarded noise turn ({word_count} word(s)): {text!r}")
-            return
-        if confidence is not None and confidence < MIN_CONFIDENCE:
-            print(f"[STT] Discarded low-confidence turn "
-                  f"({confidence:.2f} < {MIN_CONFIDENCE}): {text!r}")
+        accept, reason = _should_accept_turn(text, confidence)
+        if not accept:
+            logger.info("STT discarded %s turn: %r (confidence=%s)",
+                        reason, text, confidence)
             return
 
-        conf_str = "n/a" if confidence is None else f"{confidence:.2f}"
-        print(f"[STT EndOfTurn] confidence={conf_str} text={text!r}")
+        logger.info("STT EndOfTurn confidence=%s text=%r",
+                    "n/a" if confidence is None else f"{confidence:.2f}", text)
         await self.turn_queue.put(text)
 
     @staticmethod
@@ -802,7 +870,7 @@ class DebateSession:
         except (KeyError, IndexError, TypeError, AttributeError):
             return "", None
 
-    # ── Cleanup ───────────────────────────────────────────────────
+    # ── Cleanup ──────────────────────────────────────────────────
 
     async def _close_stt(self):
         """Gracefully terminate the Deepgram STT socket with CloseStream."""
@@ -812,28 +880,31 @@ class DebateSession:
         try:
             if ws.open:
                 await ws.send(json.dumps({"type": "CloseStream"}))
-                print("[Deepgram STT] Sent CloseStream.")
+                logger.info("Deepgram STT sent CloseStream.")
                 await asyncio.sleep(0.3)   # let Deepgram flush final results
         except Exception as exc:
-            print(f"[Deepgram STT] CloseStream failed: {exc}")
+            logger.warning("Deepgram STT CloseStream failed: %s", exc)
         try:
             await ws.close()
         except Exception as exc:
-            print(f"[Deepgram STT] Socket close failed: {exc}")
+            logger.warning("Deepgram STT socket close failed: %s", exc)
         self.stt_ws = None
 
     async def cleanup(self, worker_tasks: list[asyncio.Task]):
         """Cancel every background task, then close upstream sockets."""
         self._closed = True
 
-        for task in worker_tasks + self.stt_tasks:
+        all_tasks = list(worker_tasks) + list(self.stt_tasks)
+        if self._opening_task is not None:
+            all_tasks.append(self._opening_task)
+
+        for task in all_tasks:
             task.cancel()
         # Await cancellation so no task outlives the connection
-        await asyncio.gather(*(worker_tasks + self.stt_tasks),
-                             return_exceptions=True)
+        await asyncio.gather(*all_tasks, return_exceptions=True)
 
         await self._close_stt()
-        print(f"[WS] Session {self.session_id[:8]} cleaned up.")
+        logger.info("WS session %s cleaned up.", self.session_id[:8])
 
 
 # ─────────────────────────── WebSocket route ──────────────────
@@ -841,13 +912,31 @@ class DebateSession:
 @app.websocket("/ws/debate")
 async def debate_websocket(websocket: WebSocket):
     await websocket.accept()
-    print("[WS] Client connected")
+    logger.info("WS client connected")
     session = DebateSession(websocket)
     await session.run()
+
+
+# ─────────────────────── Static frontend ──────────────────────
+# In production a single service serves API + UI: the Vite build lives in
+# frontend/dist and is mounted LAST so /ws/debate and REST routes win.
+
+_DIST_DIR = Path(__file__).parent / "frontend" / "dist"
+if _DIST_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=_DIST_DIR, html=True), name="frontend")
+else:
+    logger.warning("Static frontend not found at frontend/dist — run `npm run build`.")
 
 
 # ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",                       # required for Render routing
+        port=int(os.getenv("PORT", "8000")),  # Render injects $PORT
+        log_level=os.getenv("LOG_LEVEL", "info").lower(),
+        timeout_keep_alive=30,
+        ws_max_size=2**20,                    # 1 MB inbound WS frame cap
+    )

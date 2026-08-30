@@ -20,6 +20,7 @@ STATE FLOW
   app_help    : START -> help_coach -> END
 """
 
+import logging
 import os
 import re
 from typing import Annotated, Optional
@@ -133,8 +134,9 @@ def _structured_llm(temperature: float):
                 model=model, temperature=temperature
             ).with_structured_output(DebateReply)
         except ImportError:
-            print("[LLM] GOOGLE_API_KEY set but langchain-google-genai is "
-                  "not installed — falling back to OpenAI.")
+            logging.getLogger(__name__).warning(
+                "GOOGLE_API_KEY set but langchain-google-genai is "
+                "not installed — falling back to OpenAI.")
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o")
     # OpenAI-compatible routers (e.g. OmniRoute): point the same client at a

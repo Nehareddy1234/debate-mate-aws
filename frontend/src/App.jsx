@@ -20,12 +20,20 @@
  *   - AI text added to transcript panel when agent_response arrives
  */
 
-import { useState, useCallback, useRef } from 'react'
-import SphereVisualizer from './components/SphereVisualizer'
+import { useState, useCallback, useRef, lazy, Suspense } from 'react'
 import DebateNotes from './components/DebateNotes'
 import TranscriptOverlay from './components/TranscriptOverlay'
 import TranscriptPanel from './components/TranscriptPanel'
+import AuthScreen from './components/AuthScreen'
+import ErrorBoundary from './components/ErrorBoundary'
+import HistoryView from './components/HistoryView'
+import LandingPage from './components/LandingPage'
+import { useAuth } from './hooks/useAuth'
 import { useVoice } from './hooks/useVoice'
+
+// three.js is heavy — split it out of the main chunk and load it only when
+// the debate view renders.
+const SphereVisualizer = lazy(() => import('./components/SphereVisualizer'))
 
 // ── Setup screen ──────────────────────────────────────────────
 
@@ -72,7 +80,7 @@ function SetupScreen({ onStart }) {
                     DebateMate
                 </div>
                 <p style={{ color: '#64748b', fontSize: '0.95rem', marginTop: '8px' }}>
-                    Your real-time voice sparring partner, powered by GPT-4o
+                    Your real-time voice sparring partner, powered by Gemini
                 </p>
             </div>
 
@@ -275,6 +283,8 @@ function DebateView({
 
                     {/* Connection dot */}
                     <div
+                        role="status"
+                        aria-label={connected ? 'Connected to server' : 'Disconnected from server'}
                         style={{
                             width: '8px', height: '8px', borderRadius: '50%',
                             background: connected ? '#4ade80' : '#64748b',
@@ -286,6 +296,7 @@ function DebateView({
 
                     <button
                         onClick={onEnd}
+                        aria-label="End debate"
                         style={{
                             padding: '6px 14px',
                             borderRadius: '8px',
@@ -312,11 +323,13 @@ function DebateView({
                 <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
                     {/* Sphere */}
                     <div style={{ position: 'absolute', inset: 0 }}>
-                        <SphereVisualizer
-                            analyserRef={analyserRef}
-                            isAiSpeaking={isAiSpeaking}
-                            isUserSpeaking={isUserSpeaking}
-                        />
+                        <Suspense fallback={null}>
+                            <SphereVisualizer
+                                analyserRef={analyserRef}
+                                isAiSpeaking={isAiSpeaking}
+                                isUserSpeaking={isUserSpeaking}
+                            />
+                        </Suspense>
                     </div>
 
                     {/* Notes panel — top right of center */}
@@ -383,6 +396,7 @@ function DebateView({
                         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }}>
                             <button
                                 onClick={onHelp}
+                                aria-label="Ask AI coach for help"
                                 title="Ask AI to help you respond"
                                 style={{
                                     width: '48px',
@@ -417,6 +431,8 @@ function DebateView({
                         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }}>
                             <button
                                 onClick={onMicToggle}
+                                aria-label={micActive ? 'Mute microphone' : 'Activate microphone'}
+                                aria-pressed={micActive}
                                 className={micActive ? 'mic-active' : ''}
                                 style={{
                                     width: '64px',
@@ -466,7 +482,43 @@ function DebateView({
 let lineId = 0
 
 export default function App() {
-    const [phase, setPhase] = useState('setup')   // 'setup' | 'debate'
+    const { user, loading, login, register, logout, authFetch } = useAuth()
+    const [showAuth, setShowAuth] = useState(false)
+    const [authMode, setAuthMode] = useState('login')
+
+    if (loading) {
+        return (
+            <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', fontFamily: 'Inter, sans-serif', background: 'var(--bg)' }}>
+                Loading DebateMate…
+            </div>
+        )
+    }
+
+    if (!user) {
+        return showAuth ? (
+            <AuthScreen
+                initialMode={authMode}
+                onBack={() => setShowAuth(false)}
+                onLogin={login}
+                onRegister={register}
+            />
+        ) : (
+            <LandingPage
+                onGetStarted={() => { setAuthMode('register'); setShowAuth(true) }}
+                onLogin={() => { setAuthMode('login'); setShowAuth(true) }}
+            />
+        )
+    }
+
+    return (
+        <ErrorBoundary>
+            <AppContent user={user} logout={logout} authFetch={authFetch} />
+        </ErrorBoundary>
+    )
+}
+
+function AppContent({ user, logout, authFetch }) {
+    const [phase, setPhase] = useState('setup')   // 'setup' | 'debate' | 'history'
     const [debateConfig, setDebateConfig] = useState(null)
     const [notes, setNotes] = useState([])
     const [tips, setTips] = useState([])
@@ -580,7 +632,7 @@ export default function App() {
         }
     }, [addLine])
 
-    const { connect, disconnect, startMic, stopMic, sendMessage, connected, micActive, isUserSpeaking, isAiSpeaking, analyserRef } = useVoice({ onMessage })
+    const { connect, disconnect, startMic, stopMic, sendMessage, primeAudio, connected, micActive, isUserSpeaking, isAiSpeaking, analyserRef } = useVoice({ onMessage })
 
     const handleStart = useCallback(({ topic, user_side, first_speaker }) => {
         setDebateConfig({ topic, user_side, first_speaker })
@@ -591,8 +643,9 @@ export default function App() {
         setFullTranscript([])
         lineId = 0
         setPhase('debate')
+        primeAudio()   // unlock playback audio inside this click gesture
         connect({ topic, user_side, first_speaker })
-    }, [connect])
+    }, [connect, primeAudio])
 
     const handleMicToggle = useCallback(async () => {
         if (micActive) stopMic()
@@ -636,11 +689,10 @@ export default function App() {
         a.click()
         URL.revokeObjectURL(url)
 
-        // Also POST to server for server-side saving
+        // Also POST to server for durable per-user saving
         if (sessionIdRef.current) {
-            fetch('http://localhost:8000/save_transcript', {
+            authFetch('/transcripts', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     session_id: sessionIdRef.current,
                     topic,
@@ -652,15 +704,15 @@ export default function App() {
                         timestamp: new Date(l.timestamp).toISOString(),
                     })),
                 }),
-            }).catch(err => console.warn('[Save] Server save failed:', err))
+            })
+                .then(r => { if (!r.ok) console.warn('[Save] Server save failed:', r.status) })
+                .catch(err => console.warn('[Save] Server save failed:', err))
         }
-    }, [debateConfig])
+    }, [debateConfig, authFetch])
 
     return (
         <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: 'var(--bg)' }}>
-            {phase === 'setup' ? (
-                <SetupScreen onStart={handleStart} />
-            ) : (
+            {phase === 'debate' ? (
                 <DebateView
                     topic={debateConfig.topic}
                     userRole={debateConfig.user_side}
@@ -679,6 +731,39 @@ export default function App() {
                     onSave={handleSave}
                     isAiThinking={isAiThinking}
                 />
+            ) : (
+                <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+                    <nav
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '12px',
+                            padding: '10px 20px',
+                            borderBottom: '1px solid rgba(30,45,74,0.6)',
+                            flexShrink: 0,
+                        }}
+                    >
+                        <span style={{ color: '#64748b', fontSize: '0.8rem', marginRight: 'auto', fontFamily: 'Inter, sans-serif' }}>
+                            Signed in as <strong style={{ color: '#94a3b8' }}>{user.username}</strong>
+                        </span>
+                        <button
+                            onClick={() => setPhase(phase === 'setup' ? 'history' : 'setup')}
+                            style={navBtnStyle}
+                        >
+                            {phase === 'setup' ? '📚 Past Debates' : '🎙️ New Debate'}
+                        </button>
+                        <button onClick={logout} aria-label="Log out" style={navBtnStyle}>
+                            Log out
+                        </button>
+                    </nav>
+                    <div style={{ flex: 1, overflowY: 'auto' }}>
+                        {phase === 'setup' ? (
+                            <SetupScreen onStart={handleStart} />
+                        ) : (
+                            <HistoryView authFetch={authFetch} onBack={() => setPhase('setup')} />
+                        )}
+                    </div>
+                </div>
             )}
         </div>
     )
@@ -721,4 +806,16 @@ const inputStyle = {
     outline: 'none',
     fontFamily: 'Inter, sans-serif',
     boxSizing: 'border-box',
+}
+
+const navBtnStyle = {
+    padding: '6px 14px',
+    borderRadius: '8px',
+    border: '1px solid rgba(30,45,74,0.8)',
+    background: 'transparent',
+    color: '#64748b',
+    fontSize: '0.75rem',
+    cursor: 'pointer',
+    fontFamily: 'Inter, sans-serif',
+    transition: 'all 0.15s',
 }
